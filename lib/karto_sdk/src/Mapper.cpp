@@ -522,14 +522,14 @@ ScanMatcher * ScanMatcher::Create(
 }
 
 /**
- * Match given scan against set of scans
- * @param pScan scan being scan-matched
- * @param rBaseScans set of scans whose points will mark cells in grid as being occupied
- * @param rMean output parameter of mean (best pose) of match
- * @param rCovariance output parameter of covariance of match
- * @param doPenalize whether to penalize matches further from the search center
- * @param doRefineMatch whether to do finer-grained matching if coarse match is good (default is true)
- * @return strength of response
+ * 将给定的扫描与一组基准扫描进行匹配
+ * @param pScan 需要进行扫描匹配的目标扫描
+ * @param rBaseScans 基准扫描集合，用于在相关性网格中标记占用单元格
+ * @param rMean 输出参数，返回匹配的最佳位姿（均值）
+ * @param rCovariance 输出参数，返回匹配结果的协方差矩阵
+ * @param doPenalize 是否对远离搜索中心的匹配结果进行惩罚
+ * @param doRefineMatch 是否在粗匹配效果良好时进行精细匹配（默认为true）
+ * @return 匹配响应强度值
  */
 template<class T>
 kt_double ScanMatcher::MatchScan(
@@ -537,66 +537,67 @@ kt_double ScanMatcher::MatchScan(
   Matrix3 & rCovariance, kt_bool doPenalize, kt_bool doRefineMatch)
 {
   ///////////////////////////////////////
-  // set scan pose to be center of grid
+  // 设置扫描位姿为网格中心
 
-  // 1. get scan position
+  // 1. 获取扫描位置
   Pose2 scanPose = pScan->GetSensorPose();
 
-  // scan has no readings; cannot do scan matching
-  // best guess of pose is based off of adjusted odometer reading
+  // 如果扫描没有读数，则无法进行扫描匹配
+  // 在这种情况下，基于调整后的里程计读数作为最佳猜测位姿
   if (pScan->GetNumberOfRangeReadings() == 0) {
     rMean = scanPose;
 
-    // maximum covariance
-    rCovariance(0, 0) = MAX_VARIANCE;    // XX
-    rCovariance(1, 1) = MAX_VARIANCE;    // YY
+    // 设置最大协方差值
+    rCovariance(0, 0) = MAX_VARIANCE;    // XX方向方差
+    rCovariance(1, 1) = MAX_VARIANCE;    // YY方向方差
     rCovariance(2, 2) =
-      4 * math::Square(m_pMapper->m_pCoarseAngleResolution->GetValue());    // TH*TH
+      4 * math::Square(m_pMapper->m_pCoarseAngleResolution->GetValue());    // 角度方向方差
 
-    return 0.0;
+    return 0.0;  // 返回0响应值
   }
 
-  // 2. get size of grid
+  // 2. 获取相关性网格的尺寸
   Rectangle2<kt_int32s> roi = m_pCorrelationGrid->GetROI();
 
-  // 3. compute offset (in meters - lower left corner)
+  // 3. 计算偏移量（以米为单位 - 左下角坐标）
   Vector2<kt_double> offset;
   offset.SetX(scanPose.GetX() - (0.5 * (roi.GetWidth() - 1) * m_pCorrelationGrid->GetResolution()));
   offset.SetY(scanPose.GetY() -
     (0.5 * (roi.GetHeight() - 1) * m_pCorrelationGrid->GetResolution()));
 
-  // 4. set offset
+  // 4. 设置偏移量
   m_pCorrelationGrid->GetCoordinateConverter()->SetOffset(offset);
 
   ///////////////////////////////////////
 
-  // set up correlation grid
+  // 建立相关性网格，将基准扫描点标记为占用
   AddScans(rBaseScans, scanPose.GetPosition());
 
-  // compute how far to search in each direction
+  // 计算在每个方向上搜索的距离
   Vector2<kt_double> searchDimensions(m_pSearchSpaceProbs->GetWidth(),
     m_pSearchSpaceProbs->GetHeight());
   Vector2<kt_double> coarseSearchOffset(0.5 * (searchDimensions.GetX() - 1) *
     m_pCorrelationGrid->GetResolution(),
     0.5 * (searchDimensions.GetY() - 1) * m_pCorrelationGrid->GetResolution());
 
-  // a coarse search only checks half the cells in each dimension
+  // 粗搜索只检查每个维度的一半单元格
   Vector2<kt_double> coarseSearchResolution(2 * m_pCorrelationGrid->GetResolution(),
     2 * m_pCorrelationGrid->GetResolution());
 
-  // actual scan-matching
+  // 实际的扫描匹配过程 - 粗匹配
   kt_double bestResponse = CorrelateScan(pScan, scanPose, coarseSearchOffset,
       coarseSearchResolution,
       m_pMapper->m_pCoarseSearchAngleOffset->GetValue(),
       m_pMapper->m_pCoarseAngleResolution->GetValue(),
       doPenalize, rMean, rCovariance, false);
 
+  // 如果启用了响应扩展功能且粗匹配未找到有效结果
   if (m_pMapper->m_pUseResponseExpansion->GetValue() == true) {
     if (math::DoubleEqual(bestResponse, 0.0)) {
 #ifdef KARTO_DEBUG
       std::cout << "Mapper Info: Expanding response search space!" << std::endl;
 #endif
-      // try and increase search angle offset with 20 degrees and do another match
+      // 尝试增加搜索角度偏移量（每次增加20度）并重新匹配
       kt_double newSearchAngleOffset = m_pMapper->m_pCoarseSearchAngleOffset->GetValue();
       for (kt_int32u i = 0; i < 3; i++) {
         newSearchAngleOffset += math::DegreesToRadians(20);
@@ -605,6 +606,7 @@ kt_double ScanMatcher::MatchScan(
             newSearchAngleOffset, m_pMapper->m_pCoarseAngleResolution->GetValue(),
             doPenalize, rMean, rCovariance, false);
 
+        // 如果找到非零响应则停止扩展搜索
         if (math::DoubleEqual(bestResponse, 0.0) == false) {
           break;
         }
@@ -618,10 +620,14 @@ kt_double ScanMatcher::MatchScan(
     }
   }
 
+  // 如果需要进行精细匹配
   if (doRefineMatch) {
+    // 精细搜索的偏移量是粗搜索分辨率的一半
     Vector2<kt_double> fineSearchOffset(coarseSearchResolution * 0.5);
     Vector2<kt_double> fineSearchResolution(m_pCorrelationGrid->GetResolution(),
       m_pCorrelationGrid->GetResolution());
+
+    // 执行精细匹配，以粗匹配结果为中心进行更精细的搜索
     bestResponse = CorrelateScan(pScan, rMean, fineSearchOffset, fineSearchResolution,
         0.5 * m_pMapper->m_pCoarseAngleResolution->GetValue(),
         m_pMapper->m_pFineSearchAngleOffset->GetValue(),
@@ -633,10 +639,12 @@ kt_double ScanMatcher::MatchScan(
     ",  VARIANCE = " <<
     rCovariance(0, 0) << ", " << rCovariance(1, 1) << std::endl;
 #endif
+  // 确保返回的角度在[-π, π]范围内
   assert(math::InRange(rMean.GetHeading(), -KT_PI, KT_PI));
 
-  return bestResponse;
+  return bestResponse;  // 返回最佳匹配响应值
 }
+
 
 void ScanMatcher::operator()(const kt_double & y) const
 {
@@ -2285,7 +2293,7 @@ void Mapper::InitializeParameters()
     "Minimum value of the distance penalty multiplier so scores do not "
     "become too small.",
     0.5, GetParameterManager());
-  
+
   m_pUseResponseExpansion = new Parameter<kt_bool>(
     "UseResponseExpansion",
     "Whether to increase the search space if no good matches are initially "
@@ -2298,7 +2306,7 @@ void Mapper::InitializeParameters()
     "or unoccupied.  This prevents stray beams from messing up the map. "
     "found.",
     2, GetParameterManager());
-  
+
   m_pOccupancyThreshold = new Parameter<kt_double>(
     "OccupancyThreshold",
     "Minimum ratio of beams hitting cell to beams passing through cell to be marked as occupied",
@@ -2860,73 +2868,102 @@ kt_bool Mapper::ProcessAgainstNodesNearBy(LocalizedRangeScan * pScan, kt_bool ad
   return false;
 }
 
+/**
+ * 处理用于定位的扫描数据，该函数用于在已构建的地图中进行定位
+ * @param pScan 需要处理的激光扫描数据
+ * @param covariance 输出参数，返回位姿估计的协方差矩阵
+ * @return 处理成功返回true，否则返回false
+ */
 kt_bool Mapper::ProcessLocalization(LocalizedRangeScan * pScan, Matrix3 * covariance)
 {
-  if (pScan == NULL) {
+  // 检查输入参数是否有效
+  if (pScan == nullptr) {
     return false;
   }
 
+  // 获取激光雷达设备对象
   karto::LaserRangeFinder * pLaserRangeFinder = pScan->GetLaserRangeFinder();
 
-  // validate scan
-  if (pLaserRangeFinder == NULL || pScan == NULL ||
+  // 验证扫描数据的有效性
+  if (pLaserRangeFinder == nullptr || pScan == nullptr ||
     pLaserRangeFinder->Validate(pScan) == false)
   {
     return false;
   }
 
+  // 如果尚未初始化，则使用设备的距离阈值进行初始化
   if (m_Initialized == false) {
     // initialize mapper with range threshold from device
     Initialize(pLaserRangeFinder->GetRangeThreshold());
   }
 
+  // 获取同一传感器的上一次扫描数据
   // get last scan
   LocalizedRangeScan * pLastScan = m_pMapperSensorManager->GetLastScan(
     pScan->GetSensorName());
 
+  // 根据上一次扫描的校正位姿更新当前扫描的校正位姿
   // update scans corrected pose based on last correction
-  if (pLastScan != NULL) {
+  if (pLastScan != nullptr) {
+    // 创建从里程计位姿到校正位姿的变换
     Transform lastTransform(pLastScan->GetOdometricPose(),
       pLastScan->GetCorrectedPose());
+    // 应用该变换到当前扫描的里程计位姿上，得到初始校正位姿
     pScan->SetCorrectedPose(lastTransform.TransformPose(
         pScan->GetOdometricPose()));
   }
 
+  // 检查当前扫描与上一次扫描之间是否有足够的运动（距离或角度）
   // test if scan is outside minimum boundary
   // or if heading is larger then minimum heading
   if (!HasMovedEnough(pScan, pLastScan)) {
     return false;
   }
 
+  // 初始化协方差矩阵为单位矩阵
   Matrix3 cov;
   cov.SetToIdentity();
 
+  // 如果启用了扫描匹配并且存在上一次扫描，则进行扫描匹配来优化位姿
   // correct scan (if not first scan)
-  if (m_pUseScanMatching->GetValue() && pLastScan != NULL) {
+  if (m_pUseScanMatching->GetValue() && pLastScan != nullptr) {
     Pose2 bestPose;
+    // 使用顺序扫描匹配器将当前扫描与运行扫描缓冲区中的扫描进行匹配
     m_pSequentialScanMatcher->MatchScan(pScan,
       m_pMapperSensorManager->GetRunningScans(pScan->GetSensorName()),
       bestPose,
       cov);
+    // 设置扫描的最佳估计位姿
     pScan->SetSensorPose(bestPose);
+    // 如果提供了协方差指针，则返回协方差矩阵
     if (covariance) {
       *covariance = cov;
     }
   }
 
+  // 将扫描添加到扫描管理器中并分配唯一ID
   // add scan to buffer and assign id
   m_pMapperSensorManager->AddScan(pScan);
 
-  Vertex<LocalizedRangeScan> * scan_vertex = NULL;
+  // 用于存储图中顶点的指针
+  Vertex<LocalizedRangeScan> * scan_vertex = nullptr;
+
+  // 如果启用了扫描匹配
   if (m_pUseScanMatching->GetValue()) {
     // add to graph
+    // 将扫描添加为图中的一个顶点
     scan_vertex = m_pGraph->AddVertex(pScan);
+    // 为该扫描添加边（约束）
     m_pGraph->AddEdges(pScan, cov);
 
+    // 将扫描添加到运行扫描缓冲区中
     m_pMapperSensorManager->AddRunningScan(pScan);
 
+    // 如果启用了回环检测
     if (m_pDoLoopClosing->GetValue()) {
+      // 获取所有传感器名称
       std::vector<Name> deviceNames = m_pMapperSensorManager->GetSensorNames();
+      // 对每个传感器尝试进行回环检测
       const_forEach(std::vector<Name>, &deviceNames)
       {
         m_pGraph->TryCloseLoop(pScan, *iter);
@@ -2934,11 +2971,15 @@ kt_bool Mapper::ProcessLocalization(LocalizedRangeScan * pScan, Matrix3 * covari
     }
   }
 
+  // 设置当前扫描为该传感器的最后一次扫描
   m_pMapperSensorManager->SetLastScan(pScan);
+
+  // 将扫描添加到定位缓冲区中（用于定位模式下的特殊处理）
   AddScanToLocalizationBuffer(pScan, scan_vertex);
 
   return true;
 }
+
 
 void Mapper::AddScanToLocalizationBuffer(LocalizedRangeScan * pScan, Vertex <LocalizedRangeScan> * scan_vertex)
 {

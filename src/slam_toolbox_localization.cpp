@@ -142,68 +142,94 @@ void LocalizationSlamToolbox::laserCallback(
 }
 
 /*****************************************************************************/
+/**
+ * 在定位模式下处理激光扫描数据
+ * @param laser 激光雷达设备对象
+ * @param scan ROS激光扫描消息的共享指针
+ * @param odom_pose 从里程计获取的位姿
+ * @return 处理后的LocalizedRangeScan对象指针，如果处理失败则返回nullptr
+ */
 LocalizedRangeScan * LocalizationSlamToolbox::addScan(
   LaserRangeFinder * laser,
   const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
   Pose2 & odom_pose)
 /*****************************************************************************/
 {
+  // 获取位姿互斥锁，确保线程安全
   boost::mutex::scoped_lock l(pose_mutex_);
 
+  // 如果当前是定位模式且有待处理的近区位姿请求，则切换到近区处理模式
   if (processor_type_ == PROCESS_LOCALIZATION && process_near_pose_) {
     processor_type_ = PROCESS_NEAR_REGION;
   }
 
+  // 将ROS激光扫描数据转换为Karto系统的LocalizedRangeScan对象
   LocalizedRangeScan * range_scan = getLocalizedRangeScan(
     laser, scan, odom_pose);
 
-  // Add the localized range scan to the smapper
+  // 获取SLAM映射器互斥锁，确保线程安全
   boost::mutex::scoped_lock lock(smapper_mutex_);
+
+  // 处理结果标志和变换更新标志
   bool processed = false, update_reprocessing_transform = false;
 
+  // 初始化协方差矩阵为单位矩阵
   Matrix3 covariance;
   covariance.SetToIdentity();
 
+  // 根据处理器类型执行不同的处理逻辑,定位初始化
   if (processor_type_ == PROCESS_NEAR_REGION) {
+    // 近区处理模式（当用户请求在特定区域进行定位时）
     if (!process_near_pose_) {
+      // 如果没有有效的近区位姿请求，则报错并返回
       RCLCPP_ERROR(get_logger(),
         "Process near region called without a "
         "valid region request. Ignoring scan.");
       return nullptr;
     }
 
-    // set our position to the requested pose and process
+    // 将扫描的里程计位姿设置为请求的近区位姿
     range_scan->SetOdometricPose(*process_near_pose_);
+    // 将校正位姿也设置为相同的值（初始估计）
     range_scan->SetCorrectedPose(range_scan->GetOdometricPose());
+    // 重置近区位姿请求
     process_near_pose_.reset(nullptr);
+
+    // 使用近区节点处理方法处理扫描，将扫描添加到定位缓冲区
     processed = smapper_->getMapper()->ProcessAgainstNodesNearBy(range_scan, true, &covariance);
 
-    // reset to localization mode
+    // 需要更新重处理变换
     update_reprocessing_transform = true;
+    // 处理完成后重置为定位模式
     processor_type_ = PROCESS_LOCALIZATION;
   } else if (processor_type_ == PROCESS_LOCALIZATION) {
+    // 标准定位模式处理
     processed = smapper_->getMapper()->ProcessLocalization(range_scan, &covariance);
     update_reprocessing_transform = false;
   } else {
+    // 处理器类型错误，记录致命错误并退出
     RCLCPP_FATAL(get_logger(), "LocalizationSlamToolbox: "
       "No valid processor type set! Exiting.");
     exit(-1);
   }
 
-  // if successfully processed, create odom to map transformation
+  // 如果处理失败，删除扫描对象并返回空指针
   if (!processed) {
     delete range_scan;
     range_scan = nullptr;
   } else {
-    // compute our new transform
+    // 处理成功，计算并发布从里程计到地图的变换
     setTransformFromPoses(range_scan->GetCorrectedPose(), odom_pose,
       scan->header.stamp, update_reprocessing_transform);
 
+    // 发布当前位姿估计和协方差
     publishPose(range_scan->GetCorrectedPose(), covariance, scan->header.stamp);
   }
 
+  // 返回处理后的扫描对象
   return range_scan;
 }
+
 
 /*****************************************************************************/
 void LocalizationSlamToolbox::localizePoseCallback(
