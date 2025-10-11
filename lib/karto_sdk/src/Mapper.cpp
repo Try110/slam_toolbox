@@ -1518,63 +1518,92 @@ void MapperGraph::AddEdges(LocalizedRangeScan * pScan, const Matrix3 & rCovarian
   }
 }
 
-kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSensorName)
+kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan,
+                                  const Name & rSensorName)
 {
-  kt_bool loopClosed = false;
+  kt_bool loopClosed = false;          // 回环是否成功闭合的标志
+  kt_int32u scanIndex = 0;             // 下次搜索的起始序号，用于逐段查找
 
-  kt_int32u scanIndex = 0;
+  // 1. 从 pose graph 里捞出一条“可能形成回环”的候选关键帧链
+  LocalizedRangeScanVector candidateChain =
+      FindPossibleLoopClosure(pScan, rSensorName, scanIndex);
 
-  LocalizedRangeScanVector candidateChain = FindPossibleLoopClosure(pScan, rSensorName, scanIndex);
-
+  // 2. 只要还有候选链，就持续尝试
   while (!candidateChain.empty()) {
-    Pose2 bestPose;
-    Matrix3 covariance;
-    kt_double coarseResponse = m_pLoopScanMatcher->MatchScan(pScan, candidateChain,
-        bestPose, covariance, false, false);
+    Pose2   bestPose;                  // 匹配到的最佳位姿
+    Matrix3 covariance;                // 对应的协方差
 
+    // 3. **粗匹配**：用较低分辨率快速试配
+    kt_double coarseResponse =
+        m_pLoopScanMatcher->MatchScan(pScan, candidateChain,
+                                      bestPose, covariance,
+                                      false,      // 不惩罚远离中心
+                                      false);     // 不做精细细化
+
+    // 4. 打印粗匹配得分与方差，供调试
     std::stringstream stream;
-    stream << "COARSE RESPONSE: " << coarseResponse <<
-      " (> " << m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue() << ")" <<
-      std::endl;
-    stream << "            var: " << covariance(0, 0) << ",  " << covariance(1, 1) <<
-      " (< " << m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue() << ")";
-
+    stream << "COARSE RESPONSE: " << coarseResponse
+           << " (> " << m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue() << ")\n"
+           << "            var: " << covariance(0, 0)
+           << ",  " << covariance(1, 1)
+           << " (< " << m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue() << ")";
     m_pMapper->FireLoopClosureCheck(stream.str());
 
-    if ((coarseResponse > m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue()) &&
-      (covariance(0, 0) < m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()) &&
-      (covariance(1, 1) < m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()))
+    // 5. 粗匹配通过阈值 → 进入精匹配
+    if ((coarseResponse >
+         m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue()) &&
+        (covariance(0, 0) <
+         m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()) &&
+        (covariance(1, 1) <
+         m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()))
     {
-      LocalizedRangeScan tmpScan(pScan->GetSensorName(), pScan->GetRangeReadingsVector());
+      // 6. 复制一份当前扫描，用于精匹配试验
+      LocalizedRangeScan tmpScan(pScan->GetSensorName(),
+                                 pScan->GetRangeReadingsVector());
       tmpScan.SetUniqueId(pScan->GetUniqueId());
       tmpScan.SetTime(pScan->GetTime());
       tmpScan.SetStateId(pScan->GetStateId());
       tmpScan.SetCorrectedPose(pScan->GetCorrectedPose());
-      tmpScan.SetSensorPose(bestPose);    // This also updates OdometricPose.
-      kt_double fineResponse = m_pMapper->m_pSequentialScanMatcher->MatchScan(&tmpScan,
-          candidateChain,
-          bestPose, covariance, false);
+      tmpScan.SetSensorPose(bestPose);   // 把粗匹配结果先摆上去
 
+      // 7. **精匹配**：用正常分辨率再配一次
+      kt_double fineResponse =
+          m_pMapper->m_pSequentialScanMatcher->MatchScan(&tmpScan,
+                                                         candidateChain,
+                                                         bestPose,
+                                                         covariance,
+                                                         false);
+
+      // 8. 打印精匹配得分
       std::stringstream stream1;
-      stream1 << "FINE RESPONSE: " << fineResponse << " (>" <<
-        m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue() << ")" << std::endl;
+      stream1 << "FINE RESPONSE: " << fineResponse
+              << " (> " << m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue() << ")";
       m_pMapper->FireLoopClosureCheck(stream1.str());
 
-      if (fineResponse < m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue()) {
+      // 9. 精匹配得分不够 → 拒绝
+      if (fineResponse <
+          m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue()) {
         m_pMapper->FireLoopClosureCheck("REJECTED!");
-      } else {
+      }
+      // 10. 精匹配通过 → 真正闭合回环
+      else {
         m_pMapper->FireBeginLoopClosure("Closing loop...");
 
+        // 10-1. 把最佳位姿写回当前扫描
         pScan->SetSensorPose(bestPose);
+
+        // 10-2. 在 pose graph 里加一条回环边
         LinkChainToScan(candidateChain, pScan, bestPose, covariance);
+
+        // 10-3. 触发图优化，全局纠正位姿
         CorrectPoses();
 
         m_pMapper->FireEndLoopClosure("Loop closed!");
-
-        loopClosed = true;
+        loopClosed = true;          // 标记本次成功闭合
       }
     }
 
+    // 11. 继续找下一条可能形成回环的链
     candidateChain = FindPossibleLoopClosure(pScan, rSensorName, scanIndex);
   }
 
@@ -1979,54 +2008,65 @@ Pose2 MapperGraph::ComputeWeightedMean(
 }
 
 LocalizedRangeScanVector MapperGraph::FindPossibleLoopClosure(
-  LocalizedRangeScan * pScan,
-  const Name & rSensorName,
-  kt_int32u & rStartNum)
+  LocalizedRangeScan * pScan,          // 当前新关键帧
+  const Name & rSensorName,            // 激光雷达名字（多雷达时用）
+  kt_int32u & rStartNum)               // 从第几个序号开始找（引用，下次接着用）
 {
-  LocalizedRangeScanVector chain;    // return value
+  LocalizedRangeScanVector chain;      // 最终返回的“候选链”
 
+  // 1. 拿到当前帧的参考位姿（用重心 or 传感器位姿，看参数）
   Pose2 pose = pScan->GetReferencePose(m_pMapper->m_pUseScanBarycenter->GetValue());
 
-  // possible loop closure chain should not include close scans that have a
-  // path of links to the scan of interest
+  // 2. 把“图里已经跟当前帧连过边”的邻居帧拎出来；
+  //    这些帧不能放进候选链，否则就变成“局部匹配”而非“回环”。
   const LocalizedRangeScanVector nearLinkedScans =
-    FindNearLinkedScans(pScan, m_pMapper->m_pLoopSearchMaximumDistance->GetValue());
+    FindNearLinkedScans(pScan,
+                        m_pMapper->m_pLoopSearchMaximumDistance->GetValue());
 
-  kt_int32u nScans =
-    static_cast<kt_int32u>(m_pMapper->m_pMapperSensorManager->GetScans(rSensorName).size());
+  // 3. 拿到该雷达至今全部关键帧数量
+  kt_int32u nScans = static_cast<kt_int32u>(
+      m_pMapper->m_pMapperSensorManager->GetScans(rSensorName).size());
+
+  // 4. 从上次停的地方继续往后扫
   for (; rStartNum < nScans; rStartNum++) {
-    LocalizedRangeScan * pCandidateScan = m_pMapper->m_pMapperSensorManager->GetScan(rSensorName,
-        rStartNum);
+    LocalizedRangeScan * pCandidateScan =
+        m_pMapper->m_pMapperSensorManager->GetScan(rSensorName, rStartNum);
 
-    if (pCandidateScan == NULL) {
-      continue;
-    }
+    if (pCandidateScan == NULL) continue;   // 安全跳过
 
+    // 5. 拿候选帧的位姿
     Pose2 candidateScanPose = pCandidateScan->GetReferencePose(
-      m_pMapper->m_pUseScanBarycenter->GetValue());
+        m_pMapper->m_pUseScanBarycenter->GetValue());
 
-    kt_double squaredDistance = candidateScanPose.GetPosition().SquaredDistance(pose.GetPosition());
+    // 6. 算空间距离（平方，省开方）
+    kt_double squaredDistance =
+        candidateScanPose.GetPosition().SquaredDistance(pose.GetPosition());
+
+    // 7. 距离在阈值内 → 有可能成环
     if (squaredDistance <
-      math::Square(m_pMapper->m_pLoopSearchMaximumDistance->GetValue()) + KT_TOLERANCE)
+        math::Square(m_pMapper->m_pLoopSearchMaximumDistance->GetValue()) + KT_TOLERANCE)
     {
-      // a linked scan cannot be in the chain
-      if (find(nearLinkedScans.begin(), nearLinkedScans.end(),
-        pCandidateScan) != nearLinkedScans.end())
+      // 8. 但如果该帧已经跟当前帧“有边相连”，则不能用（避免局部匹配）
+      if (std::find(nearLinkedScans.begin(), nearLinkedScans.end(),
+                    pCandidateScan) != nearLinkedScans.end())
       {
-        chain.clear();
+        chain.clear();                 // 一旦碰到“邻居”，前面攒的链作废
       } else {
-        chain.push_back(pCandidateScan);
-      }
-    } else {
-      // return chain if it is long "enough"
-      if (chain.size() >= m_pMapper->m_pLoopMatchMinimumChainSize->GetValue()) {
-        return chain;
-      } else {
-        chain.clear();
+        chain.push_back(pCandidateScan); // 否则把该帧塞进链
       }
     }
-  }
+    else   // 距离超了 → 一段连续区域结束
+    {
+      // 9. 只有链长度≥参数门槛才合格，否则扔掉
+      if (chain.size() >= m_pMapper->m_pLoopMatchMinimumChainSize->GetValue()) {
+        return chain;                  // 找到一段合格链，直接返回
+      } else {
+        chain.clear();                 // 太短，清零重来
+      }
+    }
+  } // for
 
+  // 10.返回
   return chain;
 }
 
