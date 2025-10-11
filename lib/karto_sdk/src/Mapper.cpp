@@ -641,64 +641,80 @@ kt_double ScanMatcher::MatchScan(
 #endif
   // 确保返回的角度在[-π, π]范围内
   assert(math::InRange(rMean.GetHeading(), -KT_PI, KT_PI));
-
+  std::cout << "[MatchScan] Match response: " << bestResponse << std::endl;
   return bestResponse;  // 返回最佳匹配响应值
 }
 
 
+/**
+ * TBB 并行入口：每个线程被分配一个 y 值，
+ * 负责把“当前 y 行”里所有 (x,θ) 候选位姿的匹配得分算出来并写回全局数组。
+ */
 void ScanMatcher::operator()(const kt_double & y) const
 {
-  kt_int32u poseResponseCounter;
-  kt_int32u x_pose;
+  kt_int32u poseResponseCounter;   // 在 m_pPoseResponse[] 中的线性下标
+  kt_int32u x_pose;                // 当前 x 序号
+  /* 通过 find 拿到 y 在 m_yPoses 中的序号，用于后面计算线性下标 */
   kt_int32u y_pose = std::find(m_yPoses.begin(), m_yPoses.end(), y) - m_yPoses.begin();
 
-  const kt_int32u size_x = m_xPoses.size();
+  const kt_int32u size_x = m_xPoses.size();   // x 方向候选个数，用于偏移量计算
 
+  /* 计算实际世界坐标 & 离中心距离平方，后面做距离惩罚用 */
   kt_double newPositionY = m_rSearchCenter.GetY() + y;
-  kt_double squareY = math::Square(y);
+  kt_double squareY      = math::Square(y);   // y²
 
-  for (std::vector<kt_double>::const_iterator xIter = m_xPoses.begin(); xIter != m_xPoses.end();
-    ++xIter)
+  /* --------------- 遍历同一行里的所有 x --------------- */
+  for (std::vector<kt_double>::const_iterator xIter = m_xPoses.begin();
+       xIter != m_xPoses.end(); ++xIter)
   {
-    x_pose = std::distance(m_xPoses.begin(), xIter);
+    x_pose = std::distance(m_xPoses.begin(), xIter);  // x 序号
     kt_double x = *xIter;
     kt_double newPositionX = m_rSearchCenter.GetX() + x;
-    kt_double squareX = math::Square(x);
+    kt_double squareX      = math::Square(x);         // x²
 
+    /* 把 (x,y) 转成栅格坐标，再拿一维栅格索引，后面直接查表 */
     Vector2<kt_int32s> gridPoint =
       m_pCorrelationGrid->WorldToGrid(Vector2<kt_double>(newPositionX, newPositionY));
     kt_int32s gridIndex = m_pCorrelationGrid->GridIndex(gridPoint);
     assert(gridIndex >= 0);
 
+    /* --------------- 遍历所有角度 --------------- */
     kt_double angle = 0.0;
     kt_double startAngle = m_rSearchCenter.GetHeading() - m_searchAngleOffset;
-    for (kt_int32u angleIndex = 0; angleIndex < m_nAngles; angleIndex++) {
+    for (kt_int32u angleIndex = 0; angleIndex < m_nAngles; angleIndex++)
+    {
       angle = startAngle + angleIndex * m_searchAngleResolution;
 
+      /* 1. 查表拿到当前 (angle,grid) 的原始相关得分 [0,occMax] */
       kt_double response = GetResponse(angleIndex, gridIndex);
-      if (m_doPenalize && (math::DoubleEqual(response, 0.0) == false)) {
-        // simple model (approximate Gaussian) to take odometry into account
-        kt_double squaredDistance = squareX + squareY;
+
+      /* 2. 若开启惩罚，用简单高斯模型把“离中心越远”的候选降权 */
+      if (m_doPenalize && (math::DoubleEqual(response, 0.0) == false))
+      {
+        kt_double squaredDistance = squareX + squareY;   // 离中心距离²
         kt_double distancePenalty = 1.0 - (DISTANCE_PENALTY_GAIN *
           squaredDistance / m_pMapper->m_pDistanceVariancePenalty->GetValue());
         distancePenalty = math::Maximum(distancePenalty,
-            m_pMapper->m_pMinimumDistancePenalty->GetValue());
-
-        kt_double squaredAngleDistance = math::Square(angle - m_rSearchCenter.GetHeading());
+                           m_pMapper->m_pMinimumDistancePenalty->GetValue());
+        kt_double deltaAngle = math::NormalizeAngle(angle - m_rSearchCenter.GetHeading());
+        kt_double squaredAngleDistance = math::Square(deltaAngle);
+        // kt_double squaredAngleDistance = math::Square(angle - m_rSearchCenter.GetHeading());
         kt_double anglePenalty = 1.0 - (ANGLE_PENALTY_GAIN *
           squaredAngleDistance / m_pMapper->m_pAngleVariancePenalty->GetValue());
-        anglePenalty = math::Maximum(anglePenalty, m_pMapper->m_pMinimumAnglePenalty->GetValue());
+        anglePenalty = math::Maximum(anglePenalty,
+                         m_pMapper->m_pMinimumAnglePenalty->GetValue());
 
-        response *= (distancePenalty * anglePenalty);
+        response *= (distancePenalty * anglePenalty);   // 最终得分
       }
 
-      // store response and pose
+      /* 3. 计算线性下标，把 (response, 位姿) 写回全局数组供主线程归并 */
       poseResponseCounter = (y_pose * size_x + x_pose) * (m_nAngles) + angleIndex;
       m_pPoseResponse[poseResponseCounter] =
-        std::pair<kt_double, Pose2>(response, Pose2(newPositionX, newPositionY,
-          math::NormalizeAngle(angle)));
-    }
-  }
+        std::pair<kt_double, Pose2>(response,
+                                     Pose2(newPositionX, newPositionY,
+                                           math::NormalizeAngle(angle)));
+    } // for angle
+  } // for x
 }
 
 /**
@@ -717,109 +733,108 @@ void ScanMatcher::operator()(const kt_double & y) const
  * @param doingFineMatch whether to do a finer search after coarse search
  * @return strength of response
  */
+/**
+ * 在相关栅格里以 rSearchCenter 为中心，按给定步长遍历 2D+角度 搜索空间，
+ * 找出使匹配得分最高的位姿，并计算其协方差。
+ */
 kt_double ScanMatcher::CorrelateScan(
-  LocalizedRangeScan * pScan, const Pose2 & rSearchCenter,
-  const Vector2<kt_double> & rSearchSpaceOffset,
-  const Vector2<kt_double> & rSearchSpaceResolution,
-  kt_double searchAngleOffset, kt_double searchAngleResolution,
-  kt_bool doPenalize, Pose2 & rMean, Matrix3 & rCovariance, kt_bool doingFineMatch)
+  LocalizedRangeScan * pScan,               // 当前激光帧
+  const Pose2 & rSearchCenter,              // 搜索中心位姿（粗匹配时通常是里程计/上一帧位姿）
+  const Vector2<kt_double> & rSearchSpaceOffset,    // x/y 方向搜索半宽
+  const Vector2<kt_double> & rSearchSpaceResolution,// x/y 步长
+  kt_double searchAngleOffset,              // 角度搜索半宽
+  kt_double searchAngleResolution,          // 角度步长
+  kt_bool doPenalize,                       // 是否对离中心远的候选位姿降分
+  Pose2 & rMean,                            // 输出：最优位姿
+  Matrix3 & rCovariance,                    // 输出：对应协方差
+  kt_bool doingFineMatch)                   // true=精搜索，false=粗搜索
 {
   assert(searchAngleResolution != 0.0);
 
-  // setup lookup arrays
+  /* 1. 预计算每个角度下激光点对应的栅格索引，后面直接查表 */
   m_pGridLookup->ComputeOffsets(pScan,
     rSearchCenter.GetHeading(), searchAngleOffset, searchAngleResolution);
 
-  // only initialize probability grid if computing positional covariance (during coarse match)
+  /* 2. 若是粗搜索，要初始化概率栅格，用来后续算位置协方差 */
   if (!doingFineMatch) {
     m_pSearchSpaceProbs->Clear();
-
-    // position search grid - finds lower left corner of search grid
     Vector2<kt_double> offset(rSearchCenter.GetPosition() - rSearchSpaceOffset);
     m_pSearchSpaceProbs->GetCoordinateConverter()->SetOffset(offset);
   }
 
-  // calculate position arrays
-
+  /* 3. 生成 x 方向搜索序列 [-offset, +offset]，步长 resolution */
   m_xPoses.clear();
-  kt_int32u nX = static_cast<kt_int32u>(math::Round(rSearchSpaceOffset.GetX() *
-    2.0 / rSearchSpaceResolution.GetX()) + 1);
+  kt_int32u nX = static_cast<kt_int32u>(
+        math::Round(rSearchSpaceOffset.GetX() * 2.0 / rSearchSpaceResolution.GetX()) + 1);
   kt_double startX = -rSearchSpaceOffset.GetX();
   for (kt_int32u xIndex = 0; xIndex < nX; xIndex++) {
     m_xPoses.push_back(startX + xIndex * rSearchSpaceResolution.GetX());
   }
   assert(math::DoubleEqual(m_xPoses.back(), -startX));
 
+  /* 4. 同理生成 y 方向搜索序列 */
   m_yPoses.clear();
-  kt_int32u nY = static_cast<kt_int32u>(math::Round(rSearchSpaceOffset.GetY() *
-    2.0 / rSearchSpaceResolution.GetY()) + 1);
+  kt_int32u nY = static_cast<kt_int32u>(
+        math::Round(rSearchSpaceOffset.GetY() * 2.0 / rSearchSpaceResolution.GetY()) + 1);
   kt_double startY = -rSearchSpaceOffset.GetY();
   for (kt_int32u yIndex = 0; yIndex < nY; yIndex++) {
     m_yPoses.push_back(startY + yIndex * rSearchSpaceResolution.GetY());
   }
   assert(math::DoubleEqual(m_yPoses.back(), -startY));
 
-  // calculate pose response array size
+  /* 5. 计算角度个数，申请一维数组存所有候选位姿的得分 */
   kt_int32u nAngles =
     static_cast<kt_int32u>(math::Round(searchAngleOffset * 2.0 / searchAngleResolution) + 1);
-
   kt_int32u poseResponseSize = static_cast<kt_int32u>(m_xPoses.size() * m_yPoses.size() * nAngles);
-
-  // allocate array
   m_pPoseResponse = new std::pair<kt_double, Pose2>[poseResponseSize];
 
+  /* 6. 记录搜索参数，供并行算子使用 */
   Vector2<kt_int32s> startGridPoint =
-    m_pCorrelationGrid->WorldToGrid(Vector2<kt_double>(rSearchCenter.GetX() +
-      startX, rSearchCenter.GetY() + startY));
+    m_pCorrelationGrid->WorldToGrid(Vector2<kt_double>(rSearchCenter.GetX() + startX,
+                                                         rSearchCenter.GetY() + startY));
+  m_rSearchCenter        = rSearchCenter;
+  m_searchAngleOffset    = searchAngleOffset;
+  m_nAngles              = nAngles;
+  m_searchAngleResolution= searchAngleResolution;
+  m_doPenalize           = doPenalize;
 
-  // this isn't good but its the fastest way to iterate. Should clean up later.
-  m_rSearchCenter = rSearchCenter;
-  m_searchAngleOffset = searchAngleOffset;
-  m_nAngles = nAngles;
-  m_searchAngleResolution = searchAngleResolution;
-  m_doPenalize = doPenalize;
+  /* 7. TBB 并行：对每个 y 行调用 operator()(y)，内部走完 x 与 angle 三层循环，在这里边计算 m_pPoseResponse */
   tbb::parallel_for_each(m_yPoses, (*this));
 
-  // find value of best response (in [0; 1])
+  /* 8. 并行结束后，在一维数组里找最大得分 bestResponse */
   kt_double bestResponse = -1;
   for (kt_int32u i = 0; i < poseResponseSize; i++) {
     bestResponse = math::Maximum(bestResponse, m_pPoseResponse[i].first);
 
-    // will compute positional covariance, save best relative probability for each cell
+    /* 粗搜索时，把每个栅格的最高得分记下来，后面算位置协方差要用 */
     if (!doingFineMatch) {
       const Pose2 & rPose = m_pPoseResponse[i].second;
       Vector2<kt_int32s> grid = m_pSearchSpaceProbs->WorldToGrid(rPose.GetPosition());
-      kt_double * ptr;
-
+      kt_double * ptr = nullptr;
       try {
-        ptr = (kt_double *)(m_pSearchSpaceProbs->GetDataPointer(grid));  // NOLINT
+        ptr = (kt_double *)(m_pSearchSpaceProbs->GetDataPointer(grid));
       } catch (...) {
         throw std::runtime_error("Mapper FATAL ERROR - "
                 "unable to get pointer in probability search!");
       }
-
       if (ptr == NULL) {
         throw std::runtime_error("Mapper FATAL ERROR - "
                 "Index out of range in probability search!");
       }
-
       *ptr = math::Maximum(m_pPoseResponse[i].first, *ptr);
     }
   }
 
-  // average all poses with same highest response
-  Vector2<kt_double> averagePosition;
-  kt_double thetaX = 0.0;
-  kt_double thetaY = 0.0;
+  /* 9. 可能多个候选位姿得分都等于 bestResponse，求平均位姿 */
+  Vector2<kt_double> averagePosition(0, 0);
+  kt_double thetaX = 0.0, thetaY = 0.0;
   kt_int32s averagePoseCount = 0;
   for (kt_int32u i = 0; i < poseResponseSize; i++) {
     if (math::DoubleEqual(m_pPoseResponse[i].first, bestResponse)) {
       averagePosition += m_pPoseResponse[i].second.GetPosition();
-
       kt_double heading = m_pPoseResponse[i].second.GetHeading();
       thetaX += cos(heading);
       thetaY += sin(heading);
-
       averagePoseCount++;
     }
   }
@@ -836,36 +851,31 @@ kt_double ScanMatcher::CorrelateScan(
     throw std::runtime_error("Mapper FATAL ERROR - Unable to find best position");
   }
 
-  // delete pose response array
+  /* 10. 释放临时数组 */
   delete[] m_pPoseResponse;
   m_pPoseResponse = nullptr;
 
-#ifdef KARTO_DEBUG
-  std::cout << "bestPose: " << averagePose << std::endl;
-  std::cout << "bestResponse: " << bestResponse << std::endl;
-#endif
-
+  /* 11. 根据粗/精标志，算位置或角度协方差 */
   if (!doingFineMatch) {
-    ComputePositionalCovariance(averagePose, bestResponse, rSearchCenter, rSearchSpaceOffset,
-      rSearchSpaceResolution, searchAngleResolution, rCovariance);
+    /* 粗搜索：用概率栅格里所有高分格算 x-y 协方差 */
+    ComputePositionalCovariance(averagePose, bestResponse, rSearchCenter,
+                                rSearchSpaceOffset, rSearchSpaceResolution,
+                                searchAngleResolution, rCovariance);
   } else {
+    /* 精搜索：只算角度协方差，位置协方差沿用粗搜索结果 */
     ComputeAngularCovariance(averagePose, bestResponse, rSearchCenter,
-      searchAngleOffset, searchAngleResolution, rCovariance);
+                             searchAngleOffset, searchAngleResolution,
+                             rCovariance);
   }
 
+  /* 12. 返回最优位姿与得分 */
   rMean = averagePose;
 
-#ifdef KARTO_DEBUG
-  std::cout << "bestPose: " << averagePose << std::endl;
-#endif
-
-  if (bestResponse > 1.0) {
-    bestResponse = 1.0;
-  }
-
+  if (bestResponse > 1.0) bestResponse = 1.0;
   assert(math::InRange(bestResponse, 0.0, 1.0));
   assert(math::InRange(rMean.GetHeading(), -KT_PI, KT_PI));
 
+  std::cout << "[CorrelateScan] Match response: " << bestResponse << std::endl;
   return bestResponse;
 }
 
@@ -1171,44 +1181,47 @@ PointVectorDouble ScanMatcher::FindValidPoints(
   return validPoints;
 }
 
-/**
- * Get response at given position for given rotation (only look up valid points)
- * @param angleIndex
- * @param gridPositionIndex
- * @return response
- */
-kt_double ScanMatcher::GetResponse(kt_int32u angleIndex, kt_int32s gridPositionIndex) const
+  /**
+   * 给定“角度索引”与“栅格起点”，累加所有激光点在该角度下命中栅格的占用值，
+   * 并归一化到 [0,1] 作为匹配得分。
+   * @param angleIndex        预计算角度表索引
+   * @param gridPositionIndex 候选位姿对应的栅格起点一维索引
+   * @return response         匹配得分 [0,1]，越大表示越吻合
+   */
+  kt_double ScanMatcher::GetResponse(kt_int32u angleIndex, kt_int32s gridPositionIndex) const
 {
   kt_double response = 0.0;
 
-  // add up value for each point
+  /* 直接拿栅格内存首指针，后面用偏移量累加，避免重复计算二维索引 */
   kt_int8u * pByte = m_pCorrelationGrid->GetDataPointer() + gridPositionIndex;
 
+  /* 取出该角度下“每个激光点→栅格偏移量”的预计算表 */
   const LookupArray * pOffsets = m_pGridLookup->GetLookupArray(angleIndex);
   assert(pOffsets != NULL);
 
-  // get number of points in offset list
-  kt_int32u nPoints = pOffsets->GetSize();
+  kt_int32u nPoints = pOffsets->GetSize();   // 有效激光点个数
   if (nPoints == 0) {
-    return response;
+    return response;                         // 无点直接返回 0
   }
 
-  // calculate response
+  /* 累加占用值：遍历所有激光点 */
   kt_int32s * pAngleIndexPointer = pOffsets->GetArrayPointer();
   for (kt_int32u i = 0; i < nPoints; i++) {
-    // ignore points that fall off the grid
+    /* 当前点相对于栅格起点的偏移量（已预计算，避免实时三角函数） */
     kt_int32s pointGridIndex = gridPositionIndex + pAngleIndexPointer[i];
+
+    /* 越界或无效点跳过，防止访问栅格外内存 */
     if (!math::IsUpTo(pointGridIndex,
       m_pCorrelationGrid->GetDataSize()) || pAngleIndexPointer[i] == INVALID_SCAN)
     {
       continue;
     }
 
-    // uses index offsets to efficiently find location of point in the grid
+    /* 累加该点所在栅格的占用值（0=自由，255=占用） */
     response += pByte[pAngleIndexPointer[i]];
   }
 
-  // normalize response
+  /* 归一化：除以“点数 * 最大可能占用值”，把结果压到 [0,1] */
   response /= (nPoints * GridStates_Occupied);
   assert(fabs(response) <= 1.0);
 
